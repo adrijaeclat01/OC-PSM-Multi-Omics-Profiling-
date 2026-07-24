@@ -1,4 +1,4 @@
-setwd("C:/Users/Adrija/Downloads")
+setwd("C:/Users/User/Downloads")
 list.files()
 data <- read.delim("MetsPT_Candidates.tsv", 
                    header = TRUE, 
