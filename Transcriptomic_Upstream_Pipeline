@@ -1,0 +1,186 @@
+###############################################################################
+# RNA-Seq Analysis Pipeline (Bulk RNA-Seq)
+# Dataset: SRR9601041 (BioProject: PRJNA551007)
+###############################################################################
+
+############################
+# 1. Create Project Structure
+############################
+
+mkdir -p ~/RNAseq_Project/{raw_data,fastqc,trimmed,reference,index,alignment,counts}
+cd ~/RNAseq_Project
+
+############################
+# 2. Download SRA Dataset
+############################
+
+prefetch SRR9601041
+
+############################
+# 3. Convert SRA to FASTQ
+############################
+
+fasterq-dump SRR9601041 \
+-o raw_data/SRR9601041.fastq
+
+gzip raw_data/SRR9601041.fastq
+
+############################
+# 4. Quality Check
+############################
+
+fastqc raw_data/SRR9601041.fastq.gz \
+-o fastqc/
+
+############################
+# 5. Adapter Trimming
+############################
+
+fastp \
+-i raw_data/SRR9601041.fastq.gz \
+-o trimmed/SRR9601041_trimmed.fastq.gz \
+-h trimmed/fastp.html \
+-j trimmed/fastp.json
+
+############################
+# 6. Download Reference Genome
+############################
+
+cd reference
+
+wget https://ftp.ensembl.org/pub/release-113/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz
+
+wget https://ftp.ensembl.org/pub/release-113/gtf/homo_sapiens/Homo_sapiens.GRCh38.113.gtf.gz
+
+gunzip Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz
+gunzip Homo_sapiens.GRCh38.113.gtf.gz
+
+cd ..
+
+############################
+# 7. Build HISAT2 Index
+############################
+
+hisat2-build \
+reference/Homo_sapiens.GRCh38.dna.primary_assembly.fa \
+index/genome
+
+############################
+# 8. Align Reads
+############################
+
+hisat2 \
+-x index/genome \
+-U trimmed/SRR9601041_trimmed.fastq.gz \
+-S alignment/SRR9601041.sam
+
+############################
+# 9. Convert SAM to BAM
+############################
+
+samtools view \
+-bS alignment/SRR9601041.sam \
+> alignment/SRR9601041.bam
+
+############################
+# 10. Sort BAM
+############################
+
+samtools sort \
+alignment/SRR9601041.bam \
+-o alignment/SRR9601041.sorted.bam
+
+############################
+# 11. Index BAM
+############################
+
+samtools index \
+alignment/SRR9601041.sorted.bam
+
+############################
+# 12. Attempt Gene Counting (featureCounts)
+############################
+
+featureCounts \
+-a reference/Homo_sapiens.GRCh38.113.gtf \
+-o counts/gene_counts.txt \
+alignment/SRR9601041.sorted.bam
+
+############################
+# 13. Clean GTF (Debugging)
+############################
+
+grep -v "^#" \
+reference/Homo_sapiens.GRCh38.113.gtf \
+> reference/Homo_sapiens.GRCh38.113.clean.gtf
+
+############################
+# 14. Generate Test GTF
+############################
+
+head -1000 \
+reference/Homo_sapiens.GRCh38.113.clean.gtf \
+> reference/test.gtf
+
+############################
+# 15. Final Gene Quantification using HTSeq
+############################
+
+htseq-count \
+-f bam \
+-r pos \
+-s no \
+alignment/SRR9601041.sorted.bam \
+reference/Homo_sapiens.GRCh38.113.gtf \
+> counts/SRR9601041_htseq_counts.txt
+
+############################
+# 16. View Top Expressed Genes
+############################
+
+sort -k2,2nr counts/SRR9601041_htseq_counts.txt | head -20
+
+############################
+# 17. Map Ensembl IDs to Gene Names
+############################
+
+grep "ENSG00000210082" reference/Homo_sapiens.GRCh38.113.gtf
+grep "ENSG00000199415" reference/Homo_sapiens.GRCh38.113.gtf
+
+############################
+# 18. Examine HTSeq Summary Statistics
+############################
+
+tail counts/SRR9601041_htseq_counts.txt
+
+###############################################################################
+# Final Output
+###############################################################################
+
+FASTQ
+↓
+
+FastQC Report
+
+↓
+
+Trimmed FASTQ
+
+↓
+
+HISAT2 Alignment
+
+↓
+
+Sorted BAM
+
+↓
+
+BAM Index
+
+↓
+
+Gene Counts (HTSeq)
+
+File:
+counts/SRR9601041_htseq_counts.txt
