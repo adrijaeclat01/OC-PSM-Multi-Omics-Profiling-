@@ -1,345 +1,934 @@
+setwd("C:/Users/user/Downloads")
+data <- read.delim("Grouped_34578910_PT_Report_BGS Factory Report (Normal).tsv", 
+                   header = TRUE, 
+                   sep = "\t")
+
+dim(data)
+colnames(data)
+str(data[1:5, 1:min(8, ncol(data))])
+
 # ============================================================
-# WGCNA CO-EXPRESSION NETWORK ANALYSIS PIPELINE
-# Study: OC-to-PSM Proteomic Axis
-# Comparison: Primary Tumour vs Peritoneal Metastasis
-# Author: Adrija
+# STEP 0: DIAGNOSTICS - run this first, paste me the output
+# Goal: confirm protein ID column choice + sample naming pattern
+# before we build the pivot/imputation/WGCNA script
 # ============================================================
-# REQUIREMENTS:
-# install.packages(c("WGCNA", "ggplot2", "dplyr", "igraph"))
+
+
+
+# ============================================================
+# STEP 0: DIAGNOSTICS - run this first, paste me the output
+# Goal: confirm protein ID column choice + sample naming pattern
+# before we build the pivot/imputation/WGCNA script
+# ============================================================
+
+
+cat("=== 1. All unique R.Condition values (sample/group naming) ===\n")
+print(sort(unique(data$R.Condition)))
+
+cat("\n=== 2. All unique R.FileName values ===\n")
+print(sort(unique(data$R.FileName)))
+
+cat("\n=== 3. Row count per R.Condition ===\n")
+print(table(data$R.Condition))
+
+cat("\n=== 4. Check PG.ProteinAccessions for multi-mapping (semicolons, etc) ===\n")
+acc_sample <- unique(data$PG.ProteinAccessions)[1:10]
+print(acc_sample)
+cat("Any semicolon-delimited (multi-protein) entries in PG.ProteinAccessions?\n")
+print(sum(grepl(";", unique(data$PG.ProteinAccessions))))
+cat("Total unique PG.ProteinAccessions values:\n")
+print(length(unique(data$PG.ProteinAccessions)))
+
+cat("\n=== 5. Check PG.ProteinGroups for multi-mapping ===\n")
+grp_sample <- unique(data$PG.ProteinGroups)[1:10]
+print(grp_sample)
+cat("Any semicolon-delimited entries in PG.ProteinGroups?\n")
+print(sum(grepl(";", unique(data$PG.ProteinGroups))))
+cat("Total unique PG.ProteinGroups values:\n")
+print(length(unique(data$PG.ProteinGroups)))
+
+cat("\n=== 6. Check whether PG.Quantity is constant within a (ProteinAccessions, FileName) pair ===\n")
+# Take one example protein x one example run, see how many rows it has and whether PG.Quantity is identical
+example_prot <- data$PG.ProteinAccessions[1]
+example_run  <- data$R.FileName[1]
+sub <- data[data$PG.ProteinAccessions == example_prot & data$R.FileName == example_run, ]
+cat("Number of rows for this protein x run combo:", nrow(sub), "\n")
+cat("Number of distinct PG.Quantity values in that subset (should be 1):", length(unique(sub$PG.Quantity)), "\n")
+
+cat("\n=== 7. Total number of distinct (ProteinAccessions x FileName) combinations ===\n")
+cat(length(unique(paste(data$PG.ProteinAccessions, data$R.FileName))), "\n")
+cat("Total rows in raw data:", nrow(data), "\n")
+cat("(big gap between these two numbers confirms long/fragment-level redundancy)\n")
+
+
+# Just the pieces still needed
+
+cat("=== Unique R.Condition values ===\n")
+print(sort(unique(data$R.Condition)))
+
+cat("\n=== Row count per R.Condition ===\n")
+print(table(data$R.Condition))
+
+cat("\n=== PG.ProteinAccessions multi-mapping check ===\n")
+cat("Semicolon-delimited entries:\n")
+print(sum(grepl(";", unique(data$PG.ProteinAccessions))))
+cat("Total unique PG.ProteinAccessions:\n")
+print(length(unique(data$PG.ProteinAccessions)))
+
+# ============================================================
+# STEP 1: PIVOT LONG -> WIDE
+# One row per protein (PG.ProteinAccessions), one column per sample (R.Condition)
+# ============================================================
+
+library(dplyr)
+library(tidyr)
+
+
+# --- 1a. Drop semicolon-delimited (multi-protein-group) entries ---
+# These represent ambiguous protein group assignments and are standard
+# to exclude before network-level analysis (cleaner than arbitrarily picking one).
+n_before <- length(unique(data$PG.ProteinAccessions))
+data_clean <- data %>%
+  filter(!grepl(";", PG.ProteinAccessions))
+n_after <- length(unique(data_clean$PG.ProteinAccessions))
+
+cat("Unique proteins before removing multi-mapped entries:", n_before, "\n")
+cat("Unique proteins after removing multi-mapped entries:", n_after, "\n")
+cat("Removed:", n_before - n_after, "ambiguous protein groups\n\n")
+
+# --- 1b. Deduplicate to one row per (protein, sample) ---
+# PG.Quantity is already protein-group-level (confirmed identical within
+# protein x run in diagnostics), so we just take distinct rows.
+dedup <- data_clean %>%
+  distinct(PG.ProteinAccessions, R.Condition, PG.Quantity)
+
+cat("Rows after dedup (should equal unique protein x condition combos):", nrow(dedup), "\n")
+
+# Sanity check: any protein x condition combo with >1 distinct quantity?
+# (would indicate a real conflict, not just redundant rows)
+conflict_check <- dedup %>%
+  group_by(PG.ProteinAccessions, R.Condition) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  filter(n > 1)
+
+cat("Protein x condition combos with conflicting quantities:", nrow(conflict_check), "\n")
+if (nrow(conflict_check) > 0) {
+  cat("WARNING: conflicts found - inspect before proceeding. Showing first few:\n")
+  print(head(conflict_check))
+}
+
+# --- 1c. Pivot to wide: rows = proteins, columns = samples ---
+wide_proteins_x_samples <- dedup %>%
+  pivot_wider(names_from = R.Condition, values_from = PG.Quantity)
+
+cat("\nWide matrix dimensions (proteins x [protein_id_col + samples]):\n")
+print(dim(wide_proteins_x_samples))
+cat("Column names:\n")
+print(colnames(wide_proteins_x_samples))
+
+# --- 1d. Transpose for WGCNA: WGCNA wants SAMPLES as rows, GENES as columns ---
+expr_matrix <- as.data.frame(wide_proteins_x_samples)
+rownames(expr_matrix) <- expr_matrix$PG.ProteinAccessions
+expr_matrix$PG.ProteinAccessions <- NULL
+
+# Order columns explicitly so trait assignment later is unambiguous
+sample_order <- c("CONTROL", "TEST1_3", "TEST2_9", "TEST3_4", "TEST4_5",
+                  "TEST5_7", "TEST6_8", "TEST7_10")
+expr_matrix <- expr_matrix[, sample_order]
+
+datExpr0 <- as.data.frame(t(expr_matrix))  # samples x proteins now
+
+cat("\nFinal datExpr0 dimensions (samples x proteins):\n")
+print(dim(datExpr0))
+cat("Sample (row) names:\n")
+print(rownames(datExpr0))
+
+# --- 1e. Missingness check before imputation ---
+na_per_protein <- colSums(is.na(datExpr0))
+cat("\nMissingness summary across proteins (count of NAs per protein, out of 8 samples):\n")
+print(table(na_per_protein))
+
+saveRDS(datExpr0, "datExpr0_raw_with_NAs.rds")
+cat("\nSaved datExpr0_raw_with_NAs.rds - inspect missingness table above before moving to Step 2 (filtering + imputation)\n")
+
+# Diagnose source of conflicting PG.Quantity within protein x condition
+
+library(dplyr)
+
+# Look at one conflicting example in full detail
+example <- data_clean %>%
+  filter(PG.ProteinAccessions == "A0A075B6I0", R.Condition == "TEST3_4") %>%
+  select(PG.ProteinAccessions, PG.ProteinGroups, PG.GroupLabel, R.Condition, 
+         R.FileName, R.Replicate, PG.Quantity) %>%
+  distinct()
+
+cat("=== Example conflict row detail ===\n")
+print(example)
+
+# Check: does PG.ProteinGroups differ where PG.ProteinAccessions is same + quantities differ?
+cat("\n=== Across ALL conflicts, is the conflict explained by differing PG.ProteinGroups? ===\n")
+conflict_detail <- data_clean %>%
+  group_by(PG.ProteinAccessions, R.Condition) %>%
+  filter(n_distinct(PG.Quantity) > 1) %>%
+  summarise(
+    n_distinct_quantity = n_distinct(PG.Quantity),
+    n_distinct_proteingroups = n_distinct(PG.ProteinGroups),
+    n_distinct_filename = n_distinct(R.FileName),
+    n_distinct_replicate = n_distinct(R.Replicate),
+    .groups = "drop"
+  )
+
+cat("Summary of what's driving the conflicts:\n")
+print(table(
+  explained_by_proteingroups = conflict_detail$n_distinct_proteingroups > 1,
+  explained_by_filename = conflict_detail$n_distinct_filename > 1
+))
+
+cat("\nDistribution of n_distinct_replicate among conflicting rows (is it multiple replicates per condition?):\n")
+print(table(conflict_detail$n_distinct_replicate))
+
+cat("\nDistribution of n_distinct_filename among conflicting rows:\n")
+print(table(conflict_detail$n_distinct_filename))
+
+# ============================================================
+# STEP 1 (CORRECTED): COLLAPSE REPLICATES, THEN PIVOT LONG -> WIDE
+# Each R.Condition has 2-3 technical replicate runs (distinct R.FileName/
+# R.Replicate) that must be averaged into one value per protein per condition
+# BEFORE pivoting - this was the source of the list-col / conflict issue.
+# ============================================================
+
+setwd("C:/Users/Adrija/Downloads")
+
+library(dplyr)
+library(tidyr)
+
+data <- read.delim("Grouped_34578910_PT_Report_BGS Factory Report (Normal).tsv",
+                   header = TRUE,
+                   sep = "\t")
+
+# --- 1a. Drop semicolon-delimited (multi-protein-group) entries ---
+n_before <- length(unique(data$PG.ProteinAccessions))
+data_clean <- data %>%
+  filter(!grepl(";", PG.ProteinAccessions))
+n_after <- length(unique(data_clean$PG.ProteinAccessions))
+
+cat("Unique proteins before removing multi-mapped entries:", n_before, "\n")
+cat("Unique proteins after removing multi-mapped entries:", n_after, "\n\n")
+
+# --- 1b. Collapse technical replicates: mean PG.Quantity per protein x condition ---
+# First reduce to one row per (protein, condition, filename) to avoid double-counting
+# any residual row-level redundancy within a single replicate run.
+per_replicate <- data_clean %>%
+  distinct(PG.ProteinAccessions, R.Condition, R.FileName, PG.Quantity)
+
+cat("Rows after reducing to one value per protein x condition x replicate-run:", nrow(per_replicate), "\n")
+
+# Now average across replicate runs within each condition
+collapsed <- per_replicate %>%
+  group_by(PG.ProteinAccessions, R.Condition) %>%
+  summarise(
+    PG.Quantity_mean = mean(PG.Quantity, na.rm = TRUE),
+    n_replicates      = n(),
+    .groups = "drop"
+  )
+
+cat("Rows after collapsing replicates (should equal unique protein x condition combos):", nrow(collapsed), "\n")
+cat("Replicate count distribution (how many replicate runs per protein x condition):\n")
+print(table(collapsed$n_replicates))
+
+# Sanity check: no more conflicts possible now since we've explicitly averaged
+cat("\n(No conflict check needed here - mean collapses any prior multi-value cases by design)\n")
+
+# --- 1c. Pivot to wide: rows = proteins, columns = samples ---
+wide_proteins_x_samples <- collapsed %>%
+  select(PG.ProteinAccessions, R.Condition, PG.Quantity_mean) %>%
+  pivot_wider(names_from = R.Condition, values_from = PG.Quantity_mean)
+
+cat("\nWide matrix dimensions (proteins x [protein_id_col + samples]):\n")
+print(dim(wide_proteins_x_samples))
+cat("Column names:\n")
+print(colnames(wide_proteins_x_samples))
+
+# Confirm it's now properly numeric, not list-cols
+cat("\nColumn classes (should all be numeric except protein ID):\n")
+print(sapply(wide_proteins_x_samples, class))
+
+# --- 1d. Transpose for WGCNA: samples as rows, proteins as columns ---
+expr_matrix <- as.data.frame(wide_proteins_x_samples)
+rownames(expr_matrix) <- expr_matrix$PG.ProteinAccessions
+expr_matrix$PG.ProteinAccessions <- NULL
+
+sample_order <- c("CONTROL", "TEST1_3", "TEST2_9", "TEST3_4", "TEST4_5",
+                  "TEST5_7", "TEST6_8", "TEST7_10")
+expr_matrix <- expr_matrix[, sample_order]
+
+datExpr0 <- as.data.frame(t(expr_matrix))
+
+cat("\nFinal datExpr0 dimensions (samples x proteins):\n")
+print(dim(datExpr0))
+cat("Sample (row) names:\n")
+print(rownames(datExpr0))
+cat("Confirm fully numeric matrix now:\n")
+print(class(datExpr0[1,1]))
+
+# --- 1e. Missingness check before imputation ---
+na_per_protein <- colSums(is.na(datExpr0))
+cat("\nMissingness summary across proteins (count of NAs per protein, out of 8 samples):\n")
+print(table(na_per_protein))
+
+saveRDS(datExpr0, "datExpr0_raw_with_NAs.rds")
+cat("\nSaved corrected datExpr0_raw_with_NAs.rds\n")
+
+# ============================================================
+# STEP 2: FILTER + IMPUTE
+# Filter: require >=2 real (non-NA) observations out of 8 samples
+# Impute: minimum-value style (Gaussian downshift), standard for
+#         DIA-MS MNAR missingness - preserves low-abundance signal
+#         rather than averaging it away
+# ============================================================
+
+# datExpr0 should already be in your environment from Step 1 (corrected)
+# If not, reload it:
+# datExpr0 <- readRDS("datExpr0_raw_with_NAs.rds")
+
+set.seed(42)  # reproducibility for the random downshift draws
+
+# --- 2a. Filter: keep proteins with >= 2 valid (non-NA) observations ---
+valid_counts <- colSums(!is.na(datExpr0))
+keep_proteins <- names(valid_counts)[valid_counts >= 2]
+
+cat("Proteins before filtering:", ncol(datExpr0), "\n")
+cat("Proteins kept (>=2 valid observations):", length(keep_proteins), "\n")
+cat("Proteins dropped:", ncol(datExpr0) - length(keep_proteins), "\n\n")
+
+datExpr_filtered <- datExpr0[, keep_proteins]
+
+# --- 2b. Minimum-value (Gaussian downshift) imputation ---
+# For each protein: compute mean and SD of the OBSERVED values, then draw
+# imputed values from a narrow normal distribution centered below the
+# observed minimum (not at the minimum itself, to avoid creating an
+# artificial pile-up of identical values, which can distort correlation
+# structure in WGCNA).
+#
+# Standard parameters (consistent with Perseus-style downshift):
+#   - downshift: 1.8 standard deviations below the protein's observed mean
+#   - width: imputed values drawn with SD = 0.3 * observed SD
+# These are conventional defaults in DIA-MS workflows (not arbitrary).
+
+impute_protein <- function(x, downshift = 1.8, width = 0.3) {
+  observed <- x[!is.na(x)]
+  if (length(observed) < 2) return(x)  # safety net, shouldn't trigger post-filter
+  
+  obs_mean <- mean(observed)
+  obs_sd   <- sd(observed)
+  if (is.na(obs_sd) || obs_sd == 0) obs_sd <- 0.01 * abs(obs_mean)  # avoid zero-SD edge case
+  
+  impute_mean <- obs_mean - downshift * obs_sd
+  impute_sd   <- width * obs_sd
+  
+  n_missing <- sum(is.na(x))
+  x[is.na(x)] <- rnorm(n_missing, mean = impute_mean, sd = impute_sd)
+  return(x)
+}
+
+datExpr_imputed <- as.data.frame(lapply(datExpr_filtered, impute_protein))
+rownames(datExpr_imputed) <- rownames(datExpr_filtered)
+
+cat("Post-imputation check - any remaining NAs?\n")
+print(sum(is.na(datExpr_imputed)))
+
+cat("\nFinal imputed expression matrix dimensions (samples x proteins):\n")
+print(dim(datExpr_imputed))
+
+# --- 2c. Quick sanity visualization: distribution before/after for a
+# heavily-missing protein, to confirm imputed values land below real ones ---
+missing_counts <- colSums(is.na(datExpr_filtered))
+example_protein <- names(missing_counts)[which.max(missing_counts)]
+cat("\nExample heavily-missing protein:", example_protein, "\n")
+cat("Original values (NA = missing):\n")
+print(datExpr_filtered[[example_protein]])
+cat("Imputed values:\n")
+print(datExpr_imputed[[example_protein]])
+
+saveRDS(datExpr_imputed, "datExpr_imputed.rds")
+cat("\nSaved datExpr_imputed.rds - ready for WGCNA network construction (Step 3)\n")
+
+# ============================================================
+# STEP 2 (CORRECTED): FILTER + IMPUTE
+# Fix from previous version: per-protein SD with only 2-3 real values
+# is too unstable and produced negative (biologically impossible)
+# imputed intensities. Fix: use a POOLED SD estimated across all
+# proteins with reasonably good data (>=5 valid obs), apply it
+# uniformly, and hard-clip any imputed value at a small positive floor.
+# ============================================================
+
+# datExpr0 should already be in your environment from Step 1 (corrected)
+# If not: datExpr0 <- readRDS("datExpr0_raw_with_NAs.rds")
+
+set.seed(42)
+
+# --- 2a. Filter: keep proteins with >= 2 valid (non-NA) observations ---
+valid_counts <- colSums(!is.na(datExpr0))
+keep_proteins <- names(valid_counts)[valid_counts >= 2]
+datExpr_filtered <- datExpr0[, keep_proteins]
+
+cat("Proteins kept (>=2 valid observations):", length(keep_proteins), "\n\n")
+
+# --- 2b. Estimate a POOLED standard deviation from well-measured proteins ---
+# Use proteins with >=5 valid observations (out of 8) as the reference set -
+# these have enough data points to give a trustworthy per-protein SD.
+# We then take the MEDIAN of those SDs as a single pooled noise estimate,
+# used for ALL proteins' imputation (regardless of how many obs they have).
+# This avoids the instability of computing SD from just 2-3 points per protein.
+
+well_measured <- names(valid_counts)[valid_counts >= 5]
+cat("Proteins used to estimate pooled SD (>=5 valid obs):", length(well_measured), "\n")
+
+per_protein_sd <- sapply(well_measured, function(p) {
+  sd(datExpr_filtered[[p]], na.rm = TRUE)
+})
+
+pooled_sd <- median(per_protein_sd, na.rm = TRUE)
+cat("Pooled SD estimate (median across well-measured proteins):", round(pooled_sd, 3), "\n\n")
+
+# --- 2c. Imputation using pooled SD, with hard floor at zero ---
+# Per-protein: use its OWN minimum observed value as the anchor (more
+# robust than mean when n is tiny), downshift by a fixed amount in pooled-SD
+# units, add jitter using the pooled SD (not protein's own unstable SD),
+# and clip at a small positive floor so nothing goes negative.
+
+downshift_factor <- 1.0   # how many pooled-SDs below the protein's own minimum
+jitter_width     <- 0.3   # jitter SD as a fraction of pooled SD
+floor_value      <- 0.01  # hard floor; adjust if your quantity scale differs
+
+impute_protein <- function(x, pooled_sd, downshift_factor, jitter_width, floor_value) {
+  observed <- x[!is.na(x)]
+  if (length(observed) == 0) return(x)
+  
+  obs_min <- min(observed)
+  impute_mean <- obs_min - downshift_factor * pooled_sd
+  impute_sd   <- jitter_width * pooled_sd
+  
+  n_missing <- sum(is.na(x))
+  imputed_vals <- rnorm(n_missing, mean = impute_mean, sd = impute_sd)
+  imputed_vals <- pmax(imputed_vals, floor_value)  # hard floor, no negatives
+  
+  x[is.na(x)] <- imputed_vals
+  return(x)
+}
+
+datExpr_imputed <- as.data.frame(lapply(
+  datExpr_filtered, impute_protein,
+  pooled_sd = pooled_sd, downshift_factor = downshift_factor,
+  jitter_width = jitter_width, floor_value = floor_value
+))
+rownames(datExpr_imputed) <- rownames(datExpr_filtered)
+
+cat("Post-imputation check - any remaining NAs?", sum(is.na(datExpr_imputed)), "\n")
+cat("Any negative values remaining?", sum(datExpr_imputed < 0), "\n")
+cat("Final imputed matrix dimensions:", dim(datExpr_imputed)[1], "x", dim(datExpr_imputed)[2], "\n\n")
+
+# --- 2d. Re-check the same example protein from before ---
+example_protein <- "A0A075B6I0"
+cat("Re-check example protein:", example_protein, "\n")
+cat("Original values (NA = missing):\n")
+print(datExpr_filtered[[example_protein]])
+cat("Imputed values (corrected method):\n")
+print(datExpr_imputed[[example_protein]])
+
+# --- 2e. Broader sanity check across several heavily-missing proteins ---
+missing_counts <- colSums(is.na(datExpr_filtered))
+top_missing <- names(sort(missing_counts, decreasing = TRUE))[1:5]
+cat("\n=== Sanity check across 5 most heavily-missing proteins ===\n")
+for (p in top_missing) {
+  cat("\nProtein:", p, " (", missing_counts[p], "missing out of 8)\n")
+  cat("  Original:", paste(round(datExpr_filtered[[p]], 2), collapse = ", "), "\n")
+  cat("  Imputed: ", paste(round(datExpr_imputed[[p]], 2), collapse = ", "), "\n")
+}
+
+saveRDS(datExpr_imputed, "datExpr_imputed.rds")
+cat("\nSaved corrected datExpr_imputed.rds - ready for WGCNA network construction (Step 3)\n")
+
+# ============================================================
+# STEP 2 (CORRECTED): FILTER + IMPUTE
+# ============================================================
+
+set.seed(42)
+
+# --- 2a. Filter: keep proteins with at least 2 valid (non-NA) observations ---
+valid_counts <- colSums(!is.na(datExpr0))
+keep_proteins <- names(valid_counts)[valid_counts >= 2]
+datExpr_filtered <- datExpr0[, keep_proteins]
+
+cat("Proteins kept (at least 2 valid observations):", length(keep_proteins), "\n\n")
+
+# --- 2b. Estimate a pooled standard deviation from well-measured proteins ---
+well_measured <- names(valid_counts)[valid_counts >= 5]
+cat("Proteins used to estimate pooled SD (at least 5 valid obs):", length(well_measured), "\n")
+
+per_protein_sd <- sapply(well_measured, function(p) {
+  sd(datExpr_filtered[[p]], na.rm = TRUE)
+})
+
+pooled_sd <- median(per_protein_sd, na.rm = TRUE)
+cat("Pooled SD estimate (median across well-measured proteins):", round(pooled_sd, 3), "\n\n")
+
+# --- 2c. Imputation using pooled SD, with hard floor at zero ---
+downshift_factor <- 1.0
+jitter_width     <- 0.3
+floor_value      <- 0.01
+
+impute_protein <- function(x, pooled_sd, downshift_factor, jitter_width, floor_value) {
+  observed <- x[!is.na(x)]
+  if (length(observed) == 0) return(x)
+  
+  obs_min <- min(observed)
+  impute_mean <- obs_min - downshift_factor * pooled_sd
+  impute_sd   <- jitter_width * pooled_sd
+  
+  n_missing <- sum(is.na(x))
+  imputed_vals <- rnorm(n_missing, mean = impute_mean, sd = impute_sd)
+  imputed_vals <- pmax(imputed_vals, floor_value)
+  
+  x[is.na(x)] <- imputed_vals
+  return(x)
+}
+
+datExpr_imputed <- as.data.frame(lapply(
+  datExpr_filtered, impute_protein,
+  pooled_sd = pooled_sd, downshift_factor = downshift_factor,
+  jitter_width = jitter_width, floor_value = floor_value
+))
+rownames(datExpr_imputed) <- rownames(datExpr_filtered)
+
+cat("Post-imputation check - any remaining NAs?", sum(is.na(datExpr_imputed)), "\n")
+cat("Any negative values remaining?", sum(datExpr_imputed < 0), "\n")
+cat("Final imputed matrix dimensions:", dim(datExpr_imputed)[1], "x", dim(datExpr_imputed)[2], "\n\n")
+
+# --- 2d. Re-check the same example protein from before ---
+example_protein <- "A0A075B6I0"
+cat("Re-check example protein:", example_protein, "\n")
+cat("Original values (NA = missing):\n")
+print(datExpr_filtered[[example_protein]])
+cat("Imputed values (corrected method):\n")
+print(datExpr_imputed[[example_protein]])
+
+# --- 2e. Broader sanity check across several heavily-missing proteins ---
+missing_counts <- colSums(is.na(datExpr_filtered))
+top_missing <- names(sort(missing_counts, decreasing = TRUE))[1:5]
+cat("\n=== Sanity check across 5 most heavily-missing proteins ===\n")
+for (p in top_missing) {
+  cat("\nProtein:", p, " (", missing_counts[p], "missing out of 8)\n")
+  cat("  Original:", paste(round(datExpr_filtered[[p]], 2), collapse = ", "), "\n")
+  cat("  Imputed: ", paste(round(datExpr_imputed[[p]], 2), collapse = ", "), "\n")
+}
+
+saveRDS(datExpr_imputed, "datExpr_imputed.rds")
+cat("\nSaved corrected datExpr_imputed.rds - ready for WGCNA network construction (Step 3)\n")
+
+set.seed(42)
+
+valid_counts <- colSums(!is.na(datExpr0))
+keep_proteins <- names(valid_counts)[valid_counts >= 2]
+datExpr_filtered <- datExpr0[, keep_proteins]
+
+cat("Proteins kept (at least 2 valid observations):", length(keep_proteins), "\n")
+
+downshift_fraction <- 0.5
+jitter_fraction    <- 0.15
+floor_value        <- 0.001
+
+impute_protein <- function(x, downshift_fraction, jitter_fraction, floor_value) {
+  observed <- x[!is.na(x)]
+  if (length(observed) == 0) return(x)
+  
+  obs_min <- min(observed)
+  impute_center <- obs_min * downshift_fraction
+  impute_sd     <- impute_center * jitter_fraction
+  if (impute_sd == 0) impute_sd <- floor_value
+  
+  n_missing <- sum(is.na(x))
+  imputed_vals <- rnorm(n_missing, mean = impute_center, sd = impute_sd)
+  imputed_vals <- pmax(imputed_vals, floor_value)
+  
+  x[is.na(x)] <- imputed_vals
+  return(x)
+}
+
+datExpr_imputed <- as.data.frame(lapply(
+  datExpr_filtered, impute_protein,
+  downshift_fraction = downshift_fraction,
+  jitter_fraction = jitter_fraction,
+  floor_value = floor_value
+))
+rownames(datExpr_imputed) <- rownames(datExpr_filtered)
+
+cat("Any remaining NAs?", sum(is.na(datExpr_imputed)), "\n")
+cat("Any negative values?", sum(datExpr_imputed < 0), "\n")
+cat("Final dimensions:", dim(datExpr_imputed)[1], "x", dim(datExpr_imputed)[2], "\n")
+
+check_flat <- sapply(colnames(datExpr_imputed), function(p) {
+  vals <- datExpr_imputed[[p]]
+  orig_na <- is.na(datExpr_filtered[[p]])
+  imputed_only <- vals[orig_na]
+  if (length(imputed_only) < 2) return(0)
+  sd(imputed_only)
+})
+cat("Proteins where imputed values are suspiciously flat:", sum(check_flat < 1e-6, na.rm = TRUE), "\n")
+
+check_flat <- sapply(colnames(datExpr_imputed), function(p) {
+  vals <- datExpr_imputed[[p]]
+  orig_na <- is.na(datExpr_filtered[[p]])
+  imputed_only <- vals[orig_na]
+  if (length(imputed_only) < 2) return(0)
+  sd(imputed_only)
+})
+cat("Proteins where imputed values are suspiciously flat:", sum(check_flat < 1e-6, na.rm = TRUE), "\n")
+
+
+problem_proteins <- c("A0A075B6I0", "A0A075B6K4", "O00233", "O00442", "O00757")
+for (p in problem_proteins) {
+  cat("\nProtein:", p, "\n")
+  cat("  Original:", paste(round(datExpr_filtered[[p]], 3), collapse = ", "), "\n")
+  cat("  Imputed: ", paste(round(datExpr_imputed[[p]], 3), collapse = ", "), "\n")
+}
+
+saveRDS(datExpr_imputed, "datExpr_imputed.rds")
+cat("Saved datExpr_imputed.rds\n")
+
+
+# Investigate the 539 flagged proteins properly
+
+flagged_proteins <- names(check_flat)[check_flat < 1e-6 & !is.na(check_flat)]
+cat("Number of flagged proteins:", length(flagged_proteins), "\n\n")
+
+# Look at the actual imputed values (not just their SD) for a handful of these
+cat("=== Sample of 8 flagged proteins - actual imputed values ===\n")
+sample_flagged <- flagged_proteins[1:8]
+for (p in sample_flagged) {
+  cat("\nProtein:", p, "\n")
+  cat("  Original:", paste(round(datExpr_filtered[[p]], 4), collapse = ", "), "\n")
+  cat("  Imputed: ", paste(round(datExpr_imputed[[p]], 4), collapse = ", "), "\n")
+}
+
+# Check: what's the distribution of "observed minimum" values among flagged
+# vs non-flagged proteins? If flagged proteins systematically have much
+# smaller obs_min, that confirms it's a floating-point/rounding-scale issue,
+# not a real repeated-constant bug.
+obs_min_per_protein <- sapply(colnames(datExpr_filtered), function(p) {
+  observed <- datExpr_filtered[[p]][!is.na(datExpr_filtered[[p]])]
+  min(observed)
+})
+
+cat("\n=== Observed minimum value comparison ===\n")
+cat("Median obs_min among FLAGGED proteins:", median(obs_min_per_protein[flagged_proteins]), "\n")
+non_flagged <- setdiff(colnames(datExpr_filtered), flagged_proteins)
+cat("Median obs_min among NON-flagged proteins:", median(obs_min_per_protein[non_flagged]), "\n")
+
+# Check actual numeric precision - are imputed values truly identical to
+# many decimal places, or just very close (tight cluster)?
+cat("\n=== Precision check on one flagged protein ===\n")
+p_check <- sample_flagged[1]
+vals <- datExpr_imputed[[p_check]]
+orig_na <- is.na(datExpr_filtered[[p_check]])
+imputed_only <- vals[orig_na]
+cat("Full precision imputed values for", p_check, ":\n")
+print(imputed_only)
+cat("Are any two exactly identical?", any(duplicated(imputed_only)), "\n")
+
+# ============================================================
+# STEP 3: WGCNA NETWORK CONSTRUCTION (Part A - soft threshold)
+# Input: datExpr_imputed (8 samples x 1804 proteins, fully clean)
+# ============================================================
+
+if (!require("WGCNA")) install.packages("WGCNA")
+library(WGCNA)
+
+options(stringsAsFactors = FALSE)
+
+datExpr <- datExpr_imputed
+
+# --- 3a. Check for outlier samples/proteins (WGCNA's built-in check) ---
+gsg <- goodSamplesGenes(datExpr, verbose = 3)
+cat("All samples/proteins good?", gsg$allOK, "\n")
+
+if (!gsg$allOK) {
+  cat("Removing flagged samples/proteins...\n")
+  datExpr <- datExpr[gsg$goodSamples, gsg$goodGenes]
+  cat("New dimensions:", dim(datExpr)[1], "x", dim(datExpr)[2], "\n")
+}
+
+# --- 3c. Pick soft-thresholding power ---
+powers <- c(1:20)
+sft <- pickSoftThreshold(datExpr, powerVector = powers, verbose = 5,
+                         networkType = "signed")
+
+
+pdf("soft_threshold_selection.pdf", width = 10, height = 5)
+par(mfrow = c(1, 2))
+plot(sft$fitIndices[, 1], -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+     xlab = "Soft Threshold (power)", ylab = "Scale Free Topology Model Fit, signed R^2",
+     type = "n", main = "Scale independence")
+text(sft$fitIndices[, 1], -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+     labels = powers, cex = 0.9, col = "red")
+abline(h = 0.80, col = "red")
+
+plot(sft$fitIndices[, 1], sft$fitIndices[, 5],
+     xlab = "Soft Threshold (power)", ylab = "Mean Connectivity",
+     type = "n", main = "Mean connectivity")
+text(sft$fitIndices[, 1], sft$fitIndices[, 5], labels = powers, cex = 0.9, col = "red")
+dev.off()
+cat("Saved soft_threshold_selection.pdf\n")
+
+
+cat("Full fit index table:\n")
+print(sft$fitIndices)
+
+saveRDS(sft, "sft_results.rds")
+saveRDS(datExpr, "datExpr_final_for_wgcna.rds")
+cat("Saved sft_results.rds and datExpr_final_for_wgcna.rds\n")
+
+
+# ============================================================
+# STEP 3B: NETWORK CONSTRUCTION + MODULE DETECTION
+# Comparing power = 1 vs power = 7 side by side before committing
 # ============================================================
 
 library(WGCNA)
-library(ggplot2)
-library(dplyr)
+options(stringsAsFactors = FALSE)
+
+build_modules <- function(datExpr, power, minModuleSize = 20) {
+  adjacency <- adjacency(datExpr, power = power, type = "signed")
+  
+  TOM <- TOMsimilarity(adjacency, TOMType = "signed")
+  dissTOM <- 1 - TOM
+  
+  geneTree <- hclust(as.dist(dissTOM), method = "average")
+  
+  dynamicMods <- cutreeDynamic(dendro = geneTree, distM = dissTOM,
+                               deepSplit = 2, pamRespectsDendro = FALSE,
+                               minClusterSize = minModuleSize)
+  dynamicColors <- labels2colors(dynamicMods)
+  
+  list(
+    adjacency = adjacency,
+    TOM = TOM,
+    geneTree = geneTree,
+    dynamicMods = dynamicMods,
+    dynamicColors = dynamicColors,
+    module_sizes = table(dynamicColors)
+  )
+}
+
+cat("Building network with power = 1\n")
+result_power1 <- build_modules(datExpr, power = 1)
+cat("Module sizes (power=1):\n")
+print(result_power1$module_sizes)
+
+cat("Building network with power = 7\n")
+result_power7 <- build_modules(datExpr, power = 7)
+cat("Module sizes (power=7):\n")
+print(result_power7$module_sizes)
+
+pdf("module_dendrograms_comparison.pdf", width = 12, height = 6)
+par(mfrow = c(1, 2))
+plotDendroAndColors(result_power1$geneTree, result_power1$dynamicColors,
+                    "Module colors", main = "Power = 1",
+                    dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05)
+plotDendroAndColors(result_power7$geneTree, result_power7$dynamicColors,
+                    "Module colors", main = "Power = 7",
+                    dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05)
+dev.off()
+cat("Saved module_dendrograms_comparison.pdf\n")
+
+
+saveRDS(result_power1, "wgcna_result_power1.rds")
+saveRDS(result_power7, "wgcna_result_power7.rds")
+cat("Saved both results\n")
+
+
+# ============================================================
+# STEP 4: MODULE-TRAIT CORRELATION + HUB GENE SCORING
+# Using result_power7 from Step 3b
+# ============================================================
+
+library(WGCNA)
+
+# --- 4a. Compute module eigengenes ---
+MEs0 <- moduleEigengenes(datExpr, colors = result_power7$dynamicColors)$eigengenes
+MEs <- orderMEs(MEs0)
+
+cat("Module eigengenes computed. Modules present:\n")
+print(colnames(MEs))
+
+# --- 4b. Define trait vector: CONTROL = 0, all TEST (Mets) = 1 ---
+# Matches sample order already set in datExpr
+sample_names <- rownames(datExpr)
+trait <- ifelse(sample_names == "CONTROL", 0, 1)
+names(trait) <- sample_names
+traitDF <- data.frame(MetsStatus = trait)
+rownames(traitDF) <- sample_names
+
+cat("\nTrait vector (0 = Control/Primary, 1 = Mets):\n")
+print(traitDF)
+
+# --- 4c. Module-trait correlation ---
+moduleTraitCor <- cor(MEs, traitDF, use = "p")
+moduleTraitPvalue <- corPvalueStudent(moduleTraitCor, nrow(datExpr))
+
+cat("\nModule-trait correlations (r) and p-values:\n")
+result_table <- data.frame(
+  Module = rownames(moduleTraitCor),
+  Correlation = round(moduleTraitCor[, "MetsStatus"], 4),
+  Pvalue = round(moduleTraitPvalue[, "MetsStatus"], 4)
+)
+result_table <- result_table[order(result_table$Correlation), ]
+print(result_table)
+
+# Identify the module most strongly correlated (either direction) with Mets status
+top_module_row <- result_table[which.max(abs(result_table$Correlation)), ]
+cat("\nMost strongly trait-associated module:\n")
+print(top_module_row)
+
+# --- 4d. Heatmap visualization of module-trait relationships ---
+pdf("module_trait_heatmap.pdf", width = 6, height = 10)
+textMatrix <- paste(signif(moduleTraitCor, 2), "\n(", signif(moduleTraitPvalue, 1), ")", sep = "")
+dim(textMatrix) <- dim(moduleTraitCor)
+labeledHeatmap(Matrix = moduleTraitCor,
+               xLabels = "Mets status",
+               yLabels = rownames(moduleTraitCor),
+               ySymbols = rownames(moduleTraitCor),
+               colorLabels = FALSE,
+               colors = blueWhiteRed(50),
+               textMatrix = textMatrix,
+               setStdMargins = FALSE,
+               cex.text = 0.6,
+               main = "Module-trait relationships (power=7)")
+dev.off()
+cat("\nSaved module_trait_heatmap.pdf\n")
+
+saveRDS(MEs, "module_eigengenes_power7.rds")
+saveRDS(result_table, "module_trait_correlation_power7.rds")
+cat("\nSaved eigengenes and correlation table. Report back the top module before we move to hub scoring.\n")
+
+
+# ============================================================
+# STEP 4B: HUB GENE SCORING WITHIN TURQUOISE MODULE
+# Eigenvector centrality on TOM-based adjacency,
+# restricted to turquoise module members
+# ============================================================
+
+library(WGCNA)
+
+if (!require("igraph")) {
+  install.packages("igraph")
+}
 library(igraph)
 
-# Allow multi-threading — set to number of cores available
-enableWGCNAThreads(nThreads = 4)
+# ------------------------------------------------------------
+# 4e. Extract turquoise module members
+# ------------------------------------------------------------
+turquoise_proteins <- colnames(datExpr)[
+  result_power7$dynamicColors == "turquoise"
+]
 
-# ============================================================
-# STEP 1 — LOAD AND PREPARE INPUT MATRIX
-# Input: normalized protein intensity matrix
-# Rows = samples, Columns = proteins (UniProt accessions)
-# This should be your Spectronaut normalized output,
-# transposed so samples are rows and proteins are columns.
-# ============================================================
+cat("Number of proteins in turquoise module:",
+    length(turquoise_proteins), "\n")
 
-setwd("C:/Users/User/Downloads")  
+# ------------------------------------------------------------
+# 4f. Subset the TOM to turquoise members only
+# ------------------------------------------------------------
+all_proteins <- colnames(datExpr)
+turquoise_idx <- which(all_proteins %in% turquoise_proteins)
 
-# Load your normalized matrix
-# Expected format: rows = samples, columns = proteins
-# Replace "normalized_matrix.csv" with your actual filename
-data_matrix <- read.csv("normalized_matrix.csv",
-                         row.names = 1,
-                         header = TRUE,
-                         check.names = FALSE)
+TOM_full <- result_power7$TOM
+rownames(TOM_full) <- all_proteins
+colnames(TOM_full) <- all_proteins
 
-# Confirm orientation: should be samples x proteins
-dim(data_matrix)  # should show n_samples x n_proteins
+TOM_turquoise <- TOM_full[turquoise_idx, turquoise_idx]
 
-# Check for missing values — WGCNA requires complete data
-# (Spectronaut's data-independent proportional imputation
-# should have handled this upstream; verify here)
-sum(is.na(data_matrix))
+cat("Turquoise sub-network TOM dimensions:",
+    dim(TOM_turquoise)[1], "x",
+    dim(TOM_turquoise)[2], "\n")
 
-# If any NAs remain, impute or filter:
-# data_matrix <- na.omit(data_matrix)
+# ------------------------------------------------------------
+# 4g. Build igraph network from the TOM submatrix
+# Using TOM as edge weights
+# ------------------------------------------------------------
+diag(TOM_turquoise) <- 0
 
-# Check sample clustering for outliers before proceeding
-sampleTree <- hclust(dist(data_matrix), method = "average")
-plot(sampleTree,
-     main = "Sample clustering pre-WGCNA (check for outliers)",
-     xlab = "", sub = "")
-
-
-# ============================================================
-# STEP 2 — SOFT-THRESHOLD SELECTION (SCALE-FREE TOPOLOGY)
-# Target: R² >= 0.80 for scale-free fit
-# Previous run on n=8: power = 7
-# Re-derive independently for each new cohort size
-# ============================================================
-
-powers <- c(1:20)
-
-sft <- pickSoftThreshold(
-  data_matrix,
-  powerVector = powers,
-  networkType = "signed",    # signed: preserves direction of correlation
-  verbose = 5
-)
-
-# Plot scale-free fit and mean connectivity
-par(mfrow = c(1, 2))
-
-plot(sft$fitIndices[, 1],
-     -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
-     xlab = "Soft threshold (power)",
-     ylab = "Scale free topology model fit (R²)",
-     type = "n",
-     main = "Scale-free topology fit")
-text(sft$fitIndices[, 1],
-     -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
-     labels = powers, col = "red")
-abline(h = 0.80, col = "blue")
-
-plot(sft$fitIndices[, 1],
-     sft$fitIndices[, 5],
-     xlab = "Soft threshold (power)",
-     ylab = "Mean connectivity",
-     type = "n",
-     main = "Mean connectivity")
-text(sft$fitIndices[, 1],
-     sft$fitIndices[, 5],
-     labels = powers, col = "red")
-
-# Select the lowest power where R² >= 0.80
-# Previous finalized run: power = 7 (n=8 samples)
-# Re-examine this plot and select accordingly for new n
-soft_power <- 7   # update after inspecting the plot above
-
-
-# ============================================================
-# STEP 3 — BUILD ADJACENCY MATRIX AND TOM
-# Signed network preserves positive vs negative correlations
-# TOM (Topological Overlap Matrix) captures shared neighbors
-# ============================================================
-
-adjacency <- adjacency(
-  data_matrix,
-  power = soft_power,
-  type = "signed"
-)
-
-# Convert adjacency to Topological Overlap
-TOM <- TOMsimilarity(adjacency, TOMType = "signed")
-dissTOM <- 1 - TOM
-
-
-# ============================================================
-# STEP 4 — HIERARCHICAL CLUSTERING AND MODULE DETECTION
-# Dynamic tree cut identifies modules automatically
-# Minimum module size = 30 proteins (adjust for larger cohorts)
-# ============================================================
-
-geneTree <- hclust(as.dist(dissTOM), method = "average")
-
-# Plot dendrogram
-plot(geneTree,
-     xlab = "", sub = "",
-     main = "Protein clustering dendrogram (TOM-based dissimilarity)",
-     labels = FALSE,
-     hang = 0.04)
-
-# Dynamic tree cut
-dynamicMods <- cutreeDynamic(
-  dendro = geneTree,
-  distM = dissTOM,
-  deepSplit = 2,          # higher = more, smaller modules
-  pamRespectsDendro = FALSE,
-  minClusterSize = 30     # increase for larger datasets
-)
-
-table(dynamicMods)
-
-# Convert numeric labels to color labels
-dynamicColors <- labels2colors(dynamicMods)
-table(dynamicColors)
-
-# Plot dendrogram with module colors
-plotDendroAndColors(
-  geneTree,
-  dynamicColors,
-  "Dynamic tree cut modules",
-  dendroLabels = FALSE,
-  hang = 0.03,
-  addGuide = TRUE,
-  guideHang = 0.05,
-  main = "Protein dendrogram and module colors"
-)
-
-
-# ============================================================
-# STEP 5 — MODULE-TRAIT CORRELATION
-# Associate module eigengenes with metastatic status
-# Trait: binary vector (0 = PT, 1 = Mets)
-# ============================================================
-
-# Calculate module eigengenes
-MEs <- moduleEigengenes(data_matrix, colors = dynamicColors)$eigengenes
-MEs <- orderMEs(MEs)
-
-# Define trait vector — must match sample order in data_matrix
-# 0 = Primary Tumour, 1 = Peritoneal Metastasis
-# Adjust to match your actual sample labels
-trait <- data.frame(
-  Metastasis = c(rep(0, 1), rep(1, 7))   # 1 PT, 7 Mets — update for new cohort
-)
-rownames(trait) <- rownames(data_matrix)
-
-# Correlate module eigengenes with trait
-moduleTraitCor <- cor(MEs, trait, use = "p")
-moduleTraitPvalue <- corPvalueStudent(moduleTraitCor, nrow(data_matrix))
-
-# Visualize
-textMatrix <- paste0(
-  signif(moduleTraitCor, 2), "\n(",
-  signif(moduleTraitPvalue, 1), ")"
-)
-dim(textMatrix) <- dim(moduleTraitCor)
-
-par(mar = c(6, 8.5, 3, 3))
-labeledHeatmap(
-  Matrix = moduleTraitCor,
-  xLabels = "Metastasis",
-  yLabels = names(MEs),
-  ySymbols = names(MEs),
-  colorLabels = FALSE,
-  colors = blueWhiteRed(50),
-  textMatrix = textMatrix,
-  setStdMargins = FALSE,
-  cex.text = 0.5,
-  zlim = c(-1, 1),
-  main = "Module-trait correlation"
-)
-
-# Extract the module most anti-correlated with metastasis
-# In previous run: turquoise module, r = -0.96
-best_module <- names(which.min(moduleTraitCor[, "Metastasis"]))
-cat("Module most anti-correlated with metastasis:", best_module, "\n")
-cat("Correlation:", min(moduleTraitCor[, "Metastasis"]), "\n")
-
-
-# ============================================================
-# STEP 6 — EXTRACT MODULE PROTEINS
-# Focus on the metastasis-associated module
-# ============================================================
-
-# Get protein names in the selected module
-target_color <- gsub("ME", "", best_module)  # strip "ME" prefix
-module_proteins <- colnames(data_matrix)[dynamicColors == target_color]
-
-cat("Number of proteins in", target_color, "module:", length(module_proteins), "\n")
-
-# Subset expression matrix to module proteins only
-module_expr <- data_matrix[, module_proteins]
-
-
-# ============================================================
-# STEP 7 — HUB SCORING
-# Metric 1: Eigenvector centrality (global network importance)
-# Metric 2: Intramodular connectivity / kWithin (local degree)
-# These are the two metrics used in the finalized analysis
-# ============================================================
-
-# --- Intramodular Connectivity (kWithin) ---
-# kWithin measures how strongly connected each protein is
-# to all other proteins within its own module
-connectivity <- intramodularConnectivity(adjacency, dynamicColors)
-module_connectivity <- connectivity[module_proteins, ]
-
-# --- Eigenvector Centrality ---
-# Build a co-expression graph for the module only
-# Threshold adjacency to remove weak connections
-module_adj <- adjacency[module_proteins, module_proteins]
-module_adj_thresh <- module_adj
-module_adj_thresh[module_adj_thresh < 0.1] <- 0  # threshold — adjust if needed
-
-# Build igraph object
-g <- graph_from_adjacency_matrix(
-  module_adj_thresh,
+g_turquoise <- graph_from_adjacency_matrix(
+  TOM_turquoise,
   mode = "undirected",
   weighted = TRUE,
   diag = FALSE
 )
 
-# Compute eigenvector centrality
-eigen_centrality_result <- eigen_centrality(g, directed = FALSE, weights = E(g)$weight)
-eigenvector_scores <- eigen_centrality_result$vector
+cat("Graph built:",
+    vcount(g_turquoise), "nodes,",
+    ecount(g_turquoise), "edges\n")
 
+# ------------------------------------------------------------
+# 4h. Eigenvector centrality
+# ------------------------------------------------------------
+eig_cent <- eigen_centrality(
+  g_turquoise,
+  weights = E(g_turquoise)$weight
+)$vector
 
-# ============================================================
-# STEP 8 — COMPILE AND RANK HUB SCORES
-# ============================================================
+# ------------------------------------------------------------
+# 4i. Intramodular connectivity (kWithin)
+# Sum of TOM connection strengths to other module members
+# ------------------------------------------------------------
+kWithin <- rowSums(TOM_turquoise)
 
-hub_scores <- data.frame(
-  Protein = module_proteins,
-  EigenvectorCentrality = eigenvector_scores[module_proteins],
-  IntramodularConnectivity = module_connectivity$kWithin
+# ------------------------------------------------------------
+# 4j. Combine into ranked hub table
+# ------------------------------------------------------------
+hub_table <- data.frame(
+  Protein = names(eig_cent),
+  EigenvectorCentrality = eig_cent,
+  IntramodularConnectivity = kWithin[names(eig_cent)]
 )
 
-# Rank by eigenvector centrality (primary) and kWithin (secondary)
-hub_scores$Rank_Eigenvector <- rank(-hub_scores$EigenvectorCentrality,
-                                     ties.method = "first")
-hub_scores$Rank_kWithin <- rank(-hub_scores$IntramodularConnectivity,
-                                 ties.method = "first")
+hub_table <- hub_table[
+  order(-hub_table$EigenvectorCentrality),
+]
 
-# Sort by eigenvector rank
-hub_scores <- hub_scores[order(hub_scores$Rank_Eigenvector), ]
+hub_table$Rank_Eigenvector <- 1:nrow(hub_table)
 
-# Preview top 10
-head(hub_scores, 10)
+hub_table$Rank_kWithin <- rank(
+  -hub_table$IntramodularConnectivity,
+  ties.method = "min"
+)
 
-# Export full hub score table
+# ------------------------------------------------------------
+# Display top hubs
+# ------------------------------------------------------------
+cat("\n=== TOP 15 HUB PROTEINS (turquoise module, by eigenvector centrality) ===\n")
+
+print(head(hub_table, 15))
+
+# ------------------------------------------------------------
+# Save results
+# ------------------------------------------------------------
 write.csv(
-  hub_scores,
-  paste0(target_color, "_hub_scores_power", soft_power, ".csv"),
+  hub_table,
+  "turquoise_hub_scores_power7.csv",
   row.names = FALSE
 )
 
-cat("Hub scores saved to:",
-    paste0(target_color, "_hub_scores_power", soft_power, ".csv"), "\n")
-
-
-# ============================================================
-# STEP 9 — VISUALIZE TOP HUBS
-# Bar plot of top 20 by eigenvector centrality
-# ============================================================
-
-top20 <- hub_scores[1:20, ]
-
-p_hubs <- ggplot(top20, aes(x = reorder(Protein, EigenvectorCentrality),
-                             y = EigenvectorCentrality,
-                             fill = EigenvectorCentrality)) +
-  geom_col(width = 0.8) +
-  coord_flip() +
-  scale_fill_gradient(low = "#CFE2F7", high = "#0C447C") +
-  theme_bw(base_size = 13) +
-  theme(legend.position = "none",
-        panel.grid.major.y = element_blank(),
-        plot.title = element_text(hjust = 0.5, face = "bold")) +
-  labs(title = paste0("Top 20 hub proteins — ", target_color, " module"),
-       x = NULL,
-       y = "Eigenvector centrality")
-
-ggsave(
-  paste0(target_color, "_top20_hubs.png"),
-  p_hubs,
-  width = 10, height = 8, dpi = 600, bg = "white"
+saveRDS(
+  hub_table,
+  "turquoise_hub_scores_power7.rds"
 )
 
+cat("\nSaved turquoise_hub_scores_power7.csv\n")
 
-# ============================================================
-# STEP 10 — NOTES FOR RERUNNING ON EXPANDED COHORT
-#
-# When you increase sample size (more Mets and/or more Controls):
-#
-# 1. Update the trait vector in Step 5 to match the new
-#    sample composition (adjust rep() counts accordingly).
-#
-# 2. Re-examine the soft-threshold plot in Step 2 and
-#    select the new power independently — do NOT assume
-#    power = 7 will hold for a different n. Larger n
-#    typically stabilizes at lower power, but verify.
-#
-# 3. Watch whether the turquoise module persists as the
-#    most anti-correlated module, or whether a different
-#    module takes that position — module colors are assigned
-#    by size and are not consistent across runs.
-#
-# 4. The hub list stability across runs (do NUTF2, HNRNPUL2,
-#    COPS8 remain top-ranked?) is itself a key confirmatory
-#    finding. Document which proteins appear in top 10
-#    across all runs.
-# ============================================================
-
-cat("Pipeline complete.\n")
+cat(
+  "\nNext: map these UniProt accessions to gene symbols ",
+  "(e.g. ANXA2, ACTN4, etc.) so we can compare directly ",
+  "against your prior hub list.\n"
+)
