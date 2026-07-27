@@ -1,0 +1,345 @@
+# ============================================================
+# WGCNA CO-EXPRESSION NETWORK ANALYSIS PIPELINE
+# Study: OC-to-PSM Proteomic Axis
+# Comparison: Primary Tumour vs Peritoneal Metastasis
+# Author: Adrija
+# ============================================================
+# REQUIREMENTS:
+# install.packages(c("WGCNA", "ggplot2", "dplyr", "igraph"))
+# ============================================================
+
+library(WGCNA)
+library(ggplot2)
+library(dplyr)
+library(igraph)
+
+# Allow multi-threading — set to number of cores available
+enableWGCNAThreads(nThreads = 4)
+
+# ============================================================
+# STEP 1 — LOAD AND PREPARE INPUT MATRIX
+# Input: normalized protein intensity matrix
+# Rows = samples, Columns = proteins (UniProt accessions)
+# This should be your Spectronaut normalized output,
+# transposed so samples are rows and proteins are columns.
+# ============================================================
+
+setwd("C:/Users/User/Downloads")  
+
+# Load your normalized matrix
+# Expected format: rows = samples, columns = proteins
+# Replace "normalized_matrix.csv" with your actual filename
+data_matrix <- read.csv("normalized_matrix.csv",
+                         row.names = 1,
+                         header = TRUE,
+                         check.names = FALSE)
+
+# Confirm orientation: should be samples x proteins
+dim(data_matrix)  # should show n_samples x n_proteins
+
+# Check for missing values — WGCNA requires complete data
+# (Spectronaut's data-independent proportional imputation
+# should have handled this upstream; verify here)
+sum(is.na(data_matrix))
+
+# If any NAs remain, impute or filter:
+# data_matrix <- na.omit(data_matrix)
+
+# Check sample clustering for outliers before proceeding
+sampleTree <- hclust(dist(data_matrix), method = "average")
+plot(sampleTree,
+     main = "Sample clustering pre-WGCNA (check for outliers)",
+     xlab = "", sub = "")
+
+
+# ============================================================
+# STEP 2 — SOFT-THRESHOLD SELECTION (SCALE-FREE TOPOLOGY)
+# Target: R² >= 0.80 for scale-free fit
+# Previous run on n=8: power = 7
+# Re-derive independently for each new cohort size
+# ============================================================
+
+powers <- c(1:20)
+
+sft <- pickSoftThreshold(
+  data_matrix,
+  powerVector = powers,
+  networkType = "signed",    # signed: preserves direction of correlation
+  verbose = 5
+)
+
+# Plot scale-free fit and mean connectivity
+par(mfrow = c(1, 2))
+
+plot(sft$fitIndices[, 1],
+     -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+     xlab = "Soft threshold (power)",
+     ylab = "Scale free topology model fit (R²)",
+     type = "n",
+     main = "Scale-free topology fit")
+text(sft$fitIndices[, 1],
+     -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+     labels = powers, col = "red")
+abline(h = 0.80, col = "blue")
+
+plot(sft$fitIndices[, 1],
+     sft$fitIndices[, 5],
+     xlab = "Soft threshold (power)",
+     ylab = "Mean connectivity",
+     type = "n",
+     main = "Mean connectivity")
+text(sft$fitIndices[, 1],
+     sft$fitIndices[, 5],
+     labels = powers, col = "red")
+
+# Select the lowest power where R² >= 0.80
+# Previous finalized run: power = 7 (n=8 samples)
+# Re-examine this plot and select accordingly for new n
+soft_power <- 7   # update after inspecting the plot above
+
+
+# ============================================================
+# STEP 3 — BUILD ADJACENCY MATRIX AND TOM
+# Signed network preserves positive vs negative correlations
+# TOM (Topological Overlap Matrix) captures shared neighbors
+# ============================================================
+
+adjacency <- adjacency(
+  data_matrix,
+  power = soft_power,
+  type = "signed"
+)
+
+# Convert adjacency to Topological Overlap
+TOM <- TOMsimilarity(adjacency, TOMType = "signed")
+dissTOM <- 1 - TOM
+
+
+# ============================================================
+# STEP 4 — HIERARCHICAL CLUSTERING AND MODULE DETECTION
+# Dynamic tree cut identifies modules automatically
+# Minimum module size = 30 proteins (adjust for larger cohorts)
+# ============================================================
+
+geneTree <- hclust(as.dist(dissTOM), method = "average")
+
+# Plot dendrogram
+plot(geneTree,
+     xlab = "", sub = "",
+     main = "Protein clustering dendrogram (TOM-based dissimilarity)",
+     labels = FALSE,
+     hang = 0.04)
+
+# Dynamic tree cut
+dynamicMods <- cutreeDynamic(
+  dendro = geneTree,
+  distM = dissTOM,
+  deepSplit = 2,          # higher = more, smaller modules
+  pamRespectsDendro = FALSE,
+  minClusterSize = 30     # increase for larger datasets
+)
+
+table(dynamicMods)
+
+# Convert numeric labels to color labels
+dynamicColors <- labels2colors(dynamicMods)
+table(dynamicColors)
+
+# Plot dendrogram with module colors
+plotDendroAndColors(
+  geneTree,
+  dynamicColors,
+  "Dynamic tree cut modules",
+  dendroLabels = FALSE,
+  hang = 0.03,
+  addGuide = TRUE,
+  guideHang = 0.05,
+  main = "Protein dendrogram and module colors"
+)
+
+
+# ============================================================
+# STEP 5 — MODULE-TRAIT CORRELATION
+# Associate module eigengenes with metastatic status
+# Trait: binary vector (0 = PT, 1 = Mets)
+# ============================================================
+
+# Calculate module eigengenes
+MEs <- moduleEigengenes(data_matrix, colors = dynamicColors)$eigengenes
+MEs <- orderMEs(MEs)
+
+# Define trait vector — must match sample order in data_matrix
+# 0 = Primary Tumour, 1 = Peritoneal Metastasis
+# Adjust to match your actual sample labels
+trait <- data.frame(
+  Metastasis = c(rep(0, 1), rep(1, 7))   # 1 PT, 7 Mets — update for new cohort
+)
+rownames(trait) <- rownames(data_matrix)
+
+# Correlate module eigengenes with trait
+moduleTraitCor <- cor(MEs, trait, use = "p")
+moduleTraitPvalue <- corPvalueStudent(moduleTraitCor, nrow(data_matrix))
+
+# Visualize
+textMatrix <- paste0(
+  signif(moduleTraitCor, 2), "\n(",
+  signif(moduleTraitPvalue, 1), ")"
+)
+dim(textMatrix) <- dim(moduleTraitCor)
+
+par(mar = c(6, 8.5, 3, 3))
+labeledHeatmap(
+  Matrix = moduleTraitCor,
+  xLabels = "Metastasis",
+  yLabels = names(MEs),
+  ySymbols = names(MEs),
+  colorLabels = FALSE,
+  colors = blueWhiteRed(50),
+  textMatrix = textMatrix,
+  setStdMargins = FALSE,
+  cex.text = 0.5,
+  zlim = c(-1, 1),
+  main = "Module-trait correlation"
+)
+
+# Extract the module most anti-correlated with metastasis
+# In previous run: turquoise module, r = -0.96
+best_module <- names(which.min(moduleTraitCor[, "Metastasis"]))
+cat("Module most anti-correlated with metastasis:", best_module, "\n")
+cat("Correlation:", min(moduleTraitCor[, "Metastasis"]), "\n")
+
+
+# ============================================================
+# STEP 6 — EXTRACT MODULE PROTEINS
+# Focus on the metastasis-associated module
+# ============================================================
+
+# Get protein names in the selected module
+target_color <- gsub("ME", "", best_module)  # strip "ME" prefix
+module_proteins <- colnames(data_matrix)[dynamicColors == target_color]
+
+cat("Number of proteins in", target_color, "module:", length(module_proteins), "\n")
+
+# Subset expression matrix to module proteins only
+module_expr <- data_matrix[, module_proteins]
+
+
+# ============================================================
+# STEP 7 — HUB SCORING
+# Metric 1: Eigenvector centrality (global network importance)
+# Metric 2: Intramodular connectivity / kWithin (local degree)
+# These are the two metrics used in the finalized analysis
+# ============================================================
+
+# --- Intramodular Connectivity (kWithin) ---
+# kWithin measures how strongly connected each protein is
+# to all other proteins within its own module
+connectivity <- intramodularConnectivity(adjacency, dynamicColors)
+module_connectivity <- connectivity[module_proteins, ]
+
+# --- Eigenvector Centrality ---
+# Build a co-expression graph for the module only
+# Threshold adjacency to remove weak connections
+module_adj <- adjacency[module_proteins, module_proteins]
+module_adj_thresh <- module_adj
+module_adj_thresh[module_adj_thresh < 0.1] <- 0  # threshold — adjust if needed
+
+# Build igraph object
+g <- graph_from_adjacency_matrix(
+  module_adj_thresh,
+  mode = "undirected",
+  weighted = TRUE,
+  diag = FALSE
+)
+
+# Compute eigenvector centrality
+eigen_centrality_result <- eigen_centrality(g, directed = FALSE, weights = E(g)$weight)
+eigenvector_scores <- eigen_centrality_result$vector
+
+
+# ============================================================
+# STEP 8 — COMPILE AND RANK HUB SCORES
+# ============================================================
+
+hub_scores <- data.frame(
+  Protein = module_proteins,
+  EigenvectorCentrality = eigenvector_scores[module_proteins],
+  IntramodularConnectivity = module_connectivity$kWithin
+)
+
+# Rank by eigenvector centrality (primary) and kWithin (secondary)
+hub_scores$Rank_Eigenvector <- rank(-hub_scores$EigenvectorCentrality,
+                                     ties.method = "first")
+hub_scores$Rank_kWithin <- rank(-hub_scores$IntramodularConnectivity,
+                                 ties.method = "first")
+
+# Sort by eigenvector rank
+hub_scores <- hub_scores[order(hub_scores$Rank_Eigenvector), ]
+
+# Preview top 10
+head(hub_scores, 10)
+
+# Export full hub score table
+write.csv(
+  hub_scores,
+  paste0(target_color, "_hub_scores_power", soft_power, ".csv"),
+  row.names = FALSE
+)
+
+cat("Hub scores saved to:",
+    paste0(target_color, "_hub_scores_power", soft_power, ".csv"), "\n")
+
+
+# ============================================================
+# STEP 9 — VISUALIZE TOP HUBS
+# Bar plot of top 20 by eigenvector centrality
+# ============================================================
+
+top20 <- hub_scores[1:20, ]
+
+p_hubs <- ggplot(top20, aes(x = reorder(Protein, EigenvectorCentrality),
+                             y = EigenvectorCentrality,
+                             fill = EigenvectorCentrality)) +
+  geom_col(width = 0.8) +
+  coord_flip() +
+  scale_fill_gradient(low = "#CFE2F7", high = "#0C447C") +
+  theme_bw(base_size = 13) +
+  theme(legend.position = "none",
+        panel.grid.major.y = element_blank(),
+        plot.title = element_text(hjust = 0.5, face = "bold")) +
+  labs(title = paste0("Top 20 hub proteins — ", target_color, " module"),
+       x = NULL,
+       y = "Eigenvector centrality")
+
+ggsave(
+  paste0(target_color, "_top20_hubs.png"),
+  p_hubs,
+  width = 10, height = 8, dpi = 600, bg = "white"
+)
+
+
+# ============================================================
+# STEP 10 — NOTES FOR RERUNNING ON EXPANDED COHORT
+#
+# When you increase sample size (more Mets and/or more Controls):
+#
+# 1. Update the trait vector in Step 5 to match the new
+#    sample composition (adjust rep() counts accordingly).
+#
+# 2. Re-examine the soft-threshold plot in Step 2 and
+#    select the new power independently — do NOT assume
+#    power = 7 will hold for a different n. Larger n
+#    typically stabilizes at lower power, but verify.
+#
+# 3. Watch whether the turquoise module persists as the
+#    most anti-correlated module, or whether a different
+#    module takes that position — module colors are assigned
+#    by size and are not consistent across runs.
+#
+# 4. The hub list stability across runs (do NUTF2, HNRNPUL2,
+#    COPS8 remain top-ranked?) is itself a key confirmatory
+#    finding. Document which proteins appear in top 10
+#    across all runs.
+# ============================================================
+
+cat("Pipeline complete.\n")
