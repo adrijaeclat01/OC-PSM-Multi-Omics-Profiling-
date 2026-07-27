@@ -1,0 +1,332 @@
+setwd("C:/Users/User/Downloads")
+list.files()
+data <- read.delim("MetsPT_Candidates.tsv", 
+                   header = TRUE, 
+                   sep = "\t")
+dim(data)
+colnames(data)
+
+# Re-load your data and regulation calls (skip if data/sig_proteins already in memory)
+data <- read.delim("MetsPT_Candidates.tsv", header = TRUE, sep = "\t")
+data$Regulation <- "Not Significant"
+data$Regulation[data$AVG.Log2.Ratio > 1 & data$Qvalue < 0.05] <- "Up"
+data$Regulation[data$AVG.Log2.Ratio < -1 & data$Qvalue < 0.05] <- "Down"
+
+library(dplyr)
+sig_proteins <- data %>% filter(Qvalue < 0.05 & abs(AVG.Log2.Ratio) > 1)
+
+up_proteins <- sig_proteins %>% filter(AVG.Log2.Ratio > 1)
+down_proteins <- sig_proteins %>% filter(AVG.Log2.Ratio < -1)
+
+# Full gene list enrichment (creates `reactome` and `kegg`)
+genes <- sig_proteins$Genes
+genes <- genes[!is.na(genes)]
+genes <- genes[genes != ""]
+genes <- unlist(strsplit(genes, ";"))
+genes <- trimws(genes)
+genes <- unique(genes)
+
+library(gprofiler2)
+gost_res <- gost(query = genes, organism = "hsapiens", significant = TRUE, correction_method = "fdr")
+
+bp <- gost_res$result[gost_res$result$source == "GO:BP", ]
+bp <- bp[order(bp$p_value), ]
+
+reactome <- gost_res$result[gost_res$result$source == "REAC", ]
+reactome <- reactome[order(reactome$p_value), ]
+
+kegg <- gost_res$result[gost_res$result$source == "KEGG", ]
+kegg <- kegg[order(kegg$p_value), ]
+
+# Up/down separate enrichment (creates `up_reac`, `down_reac`, `up_kegg`, `down_kegg`)
+up_genes <- up_proteins$Genes
+up_genes <- up_genes[!is.na(up_genes)]
+up_genes <- up_genes[up_genes != ""]
+up_genes <- unlist(strsplit(up_genes, ";"))
+up_genes <- trimws(up_genes)
+up_genes <- unique(up_genes)
+
+down_genes <- down_proteins$Genes
+down_genes <- down_genes[!is.na(down_genes)]
+down_genes <- down_genes[down_genes != ""]
+down_genes <- unlist(strsplit(down_genes, ";"))
+down_genes <- trimws(down_genes)
+down_genes <- unique(down_genes)
+
+up_gost <- gost(query = up_genes, organism = "hsapiens", significant = TRUE, correction_method = "fdr")
+down_gost <- gost(query = down_genes, organism = "hsapiens", significant = TRUE, correction_method = "fdr")
+
+up_reac <- up_gost$result[up_gost$result$source == "REAC", ]
+up_reac <- up_reac[order(up_reac$p_value), ]
+
+down_reac <- down_gost$result[down_gost$result$source == "REAC", ]
+down_reac <- down_reac[order(down_reac$p_value), ]
+
+up_kegg <- up_gost$result[up_gost$result$source == "KEGG", ]
+up_kegg <- up_kegg[order(up_kegg$p_value), ]
+
+down_kegg <- down_gost$result[down_gost$result$source == "KEGG", ]
+down_kegg <- down_kegg[order(down_kegg$p_value), ]
+
+
+# ============================================================
+# 1. CLEANED REACTOME PLOT (top 10, no changes needed - already clean)
+# ============================================================
+library(ggplot2)
+library(dplyr)
+library(stringr)
+
+reactome_top <- reactome[1:10, ]
+reactome_top$term_name <- factor(
+  reactome_top$term_name,
+  levels = rev(reactome_top$term_name)
+)
+
+p_reac <- ggplot(reactome_top, aes(x = term_name, y = -log10(p_value), fill = -log10(p_value))) +
+  geom_col(width = 0.8) +
+  coord_flip() +
+  scale_fill_gradientn(colours = c("#a8dadc", "#457b9d", "#1d3557"), name = expression(-log[10](FDR))) +
+  theme_bw(base_size = 13) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor = element_blank()) +
+  labs(x = NULL, y = expression(-log[10](FDR~p-value)),
+       title = "Reactome: granular reaction-level resolution")
+
+ggsave("Reactome_Barplot_Clean.png", p_reac, width = 10, height = 6, dpi = 600, bg = "white")
+
+
+# ============================================================
+# 2. CLEANED KEGG PLOT — disease-map artifacts excluded
+# These terms are known KEGG annotation artifacts: they share core
+# ribosomal/mitochondrial gene membership with disease pathway maps
+# and light up for ANY ribosome/OXPHOS-enriched gene list, regardless
+# of actual disease relevance to your tumor type.
+# ============================================================
+kegg_exclude <- c(
+  "Coronavirus disease - COVID-19",
+  "Parkinson disease",
+  "Prion disease",
+  "Huntington disease",
+  "Alzheimer disease",
+  "Amyotrophic lateral sclerosis",
+  "Pathways of neurodegeneration - multiple diseases",
+  "Diabetic cardiomyopathy",      # also a common artifact hit, drop if present
+  "Pathways of neurodegeneration" # in case truncated differently
+)
+
+kegg_clean <- kegg %>%
+  filter(!term_name %in% kegg_exclude) %>%
+  arrange(p_value)
+
+kegg_top_clean <- kegg_clean[1:10, ]
+kegg_top_clean$term_name <- factor(
+  kegg_top_clean$term_name,
+  levels = rev(kegg_top_clean$term_name)
+)
+
+p_kegg_clean <- ggplot(kegg_top_clean, aes(x = term_name, y = -log10(p_value), fill = -log10(p_value))) +
+  geom_col(width = 0.8) +
+  coord_flip() +
+  scale_fill_gradientn(colours = c("#a8dadc", "#457b9d", "#1d3557"), name = expression(-log[10](FDR))) +
+  theme_bw(base_size = 13) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor = element_blank()) +
+  labs(x = NULL, y = expression(-log[10](FDR~p-value)),
+       title = "KEGG: systems-level resolution\n(disease-map artifacts excluded)")
+
+ggsave("KEGG_Barplot_Clean.png", p_kegg_clean, width = 10, height = 6, dpi = 600, bg = "white")
+
+
+# ============================================================
+# 3. REAL, DATA-DERIVED BIOLOGICAL SHIFT PLOT
+#
+# Instead of hardcoded scores, this computes a directional score per
+# theme from your actual up_reac / down_reac / up_kegg / down_kegg
+# enrichment results (combining REAC + KEGG sources for theme coverage).
+#
+# Method: for each theme, define a set of matching term_name keywords.
+# Score = sum(-log10(p_value)) for UP-side matching terms
+#       - sum(-log10(p_value)) for DOWN-side matching terms
+# This makes the bar direction and magnitude a real function of your
+# enrichment output, not an illustration.
+# ============================================================
+
+# Combine up and down REAC + KEGG results into one searchable pool each
+up_pool   <- bind_rows(up_reac, up_kegg)
+down_pool <- bind_rows(down_reac, down_kegg)
+
+# Define keyword sets per theme (edit these if your term_names differ)
+theme_keywords <- list(
+  "Translation"                = c("[Tt]ranslat", "ribosom", "peptide chain", "NMD", "[Nn]onsense"),
+  "RNA Processing"             = c("RNA processing", "spliceosom", "mRNA splicing", "snRNP"),
+  "Oxidative Phosphorylation"  = c("[Oo]xidative phosphorylation", "[Ee]lectron transport"),
+  "Mitochondrial Metabolism"   = c("[Mm]itochondria", "TCA cycle", "[Cc]itrate cycle", "[Pp]yruvate", "fatty acid"),
+  "ECM Remodeling"             = c("extracellular matrix", "ECM", "collagen", "[Ff]ocal adhesion", "[Pp]roteoglycans"),
+  "Immune Response"            = c("immune", "interferon", "complement", "cytokine"),
+  "Coagulation"                = c("[Cc]oagulation", "[Pp]latelet", "[Hh]emostasis"),
+  "Oxidative Stress"           = c("oxidative stress", "reactive oxygen", "[Rr]edox")
+)
+
+score_theme <- function(pool, keywords) {
+  if (nrow(pool) == 0) return(0)
+  pattern <- paste(keywords, collapse = "|")
+  matched <- pool[grepl(pattern, pool$term_name), ]
+  if (nrow(matched) == 0) return(0)
+  sum(-log10(matched$p_value))
+}
+
+shift_scores <- sapply(names(theme_keywords), function(theme) {
+  up_score   <- score_theme(up_pool,   theme_keywords[[theme]])
+  down_score <- score_theme(down_pool, theme_keywords[[theme]])
+  up_score - down_score   # positive = net UP enrichment, negative = net DOWN
+})
+
+biology_shift <- data.frame(
+  Theme = names(shift_scores),
+  Score = as.numeric(shift_scores)
+)
+
+# Drop any theme with zero net signal (no matching terms on either side)
+biology_shift <- biology_shift[biology_shift$Score != 0, ]
+
+print(biology_shift)  # inspect before plotting — confirm direction makes sense
+
+p_shift <- ggplot(biology_shift, aes(x = reorder(Theme, Score), y = Score, fill = Score)) +
+  geom_col(width = 0.8) +
+  coord_flip() +
+  scale_fill_gradient2(low = "#1d3557", mid = "white", high = "#b22222", midpoint = 0) +
+  geom_hline(yintercept = 0, linewidth = 1) +
+  theme_bw(base_size = 14) +
+  theme(legend.position = "none",
+        panel.grid.minor = element_blank(),
+        panel.grid.major.y = element_blank(),
+        plot.title = element_text(hjust = 0.5, face = "bold")) +
+  labs(title = "Biological Shift in Ovarian Cancer PSM Proteome\n(derived from combined KEGG + Reactome enrichment, up vs. down DEPs)",
+       x = NULL,
+       y = expression("Net direction: " * Sigma * -log[10](p)~"(up)" - Sigma * -log[10](p)~"(down)"))
+
+ggsave("Biological_Shift_Plot_REAL.png", p_shift, width = 10, height = 6, dpi = 600, bg = "white")
+
+
+# ============================================================
+# Assumes biology_shift, up_pool, down_pool, theme_keywords,
+# score_theme() already exist from the previous script.
+# Run that script first if not already in memory.
+# ============================================================
+
+library(ggplot2)
+library(dplyr)
+
+# ============================================================
+# OPTION B — SPLIT-SCALE: two panels, each scaled to its own range
+# ============================================================
+
+# Panel 1: dominant biosynthetic-suppression themes
+biosynthesis_themes <- c("Translation", "RNA Processing",
+                         "Mitochondrial Metabolism", "Oxidative Phosphorylation")
+
+shift_biosynthesis <- biology_shift %>% filter(Theme %in% biosynthesis_themes)
+
+p_biosynthesis <- ggplot(shift_biosynthesis, aes(x = reorder(Theme, Score), y = Score, fill = Score)) +
+  geom_col(width = 0.7) +
+  coord_flip() +
+  scale_fill_gradient2(low = "#1d3557", mid = "white", high = "#b22222", midpoint = 0) +
+  geom_hline(yintercept = 0, linewidth = 1) +
+  theme_bw(base_size = 14) +
+  theme(legend.position = "none",
+        panel.grid.minor = element_blank(),
+        panel.grid.major.y = element_blank(),
+        plot.title = element_text(hjust = 0.5, face = "bold")) +
+  labs(title = "Theme 1: Biosynthetic & metabolic suppression\n(dominant signal)",
+       x = NULL, y = expression(Sigma * -log[10](p)~"(up) " - Sigma * -log[10](p)~"(down)"))
+
+ggsave("Shift_Panel1_Biosynthesis.png", p_biosynthesis, width = 8, height = 5, dpi = 600, bg = "white")
+
+# Panel 2: secondary microenvironment/invasion themes
+microenv_themes <- c("ECM Remodeling", "Immune Response", "Coagulation", "Oxidative Stress")
+
+shift_microenv <- biology_shift %>% filter(Theme %in% microenv_themes)
+
+p_microenv <- ggplot(shift_microenv, aes(x = reorder(Theme, Score), y = Score, fill = Score)) +
+  geom_col(width = 0.7) +
+  coord_flip() +
+  scale_fill_gradient2(low = "#1d3557", mid = "white", high = "#b22222", midpoint = 0) +
+  geom_hline(yintercept = 0, linewidth = 1) +
+  theme_bw(base_size = 14) +
+  theme(legend.position = "none",
+        panel.grid.minor = element_blank(),
+        panel.grid.major.y = element_blank(),
+        plot.title = element_text(hjust = 0.5, face = "bold")) +
+  labs(title = "Theme 2: Microenvironment & invasion signaling\n(secondary signal, own scale)",
+       x = NULL, y = expression(Sigma * -log[10](p)~"(up) " - Sigma * -log[10](p)~"(down)"))
+
+ggsave("Shift_Panel2_Microenvironment.png", p_microenv, width = 8, height = 5, dpi = 600, bg = "white")
+
+
+# ============================================================
+# OPTION C — RANK-NORMALIZED SCORING
+#
+# Instead of summing -log10(p) across all matching terms (which favors
+# themes with MANY matching terms, e.g. Translation has many Reactome
+# sub-steps), this uses the MEAN -log10(p) per matching term, so a
+# theme's score reflects average strength of evidence, not term count.
+# This is a real, defensible alternative scoring choice (analogous to
+# normalizing for "depth of annotation" rather than letting categories
+# with broader curation dominate purely by having more matched terms).
+# ============================================================
+
+score_theme_normalized <- function(pool, keywords, stat = "mean") {
+  if (nrow(pool) == 0) return(c(score = 0, n_terms = 0))
+  pattern <- paste(keywords, collapse = "|")
+  matched <- pool[grepl(pattern, pool$term_name), ]
+  if (nrow(matched) == 0) return(c(score = 0, n_terms = 0))
+  vals <- -log10(matched$p_value)
+  s <- if (stat == "mean") mean(vals) else median(vals)
+  c(score = s, n_terms = nrow(matched))
+}
+
+theme_names <- names(theme_keywords)
+
+norm_results <- lapply(theme_names, function(theme) {
+  up_res   <- score_theme_normalized(up_pool,   theme_keywords[[theme]])
+  down_res <- score_theme_normalized(down_pool, theme_keywords[[theme]])
+  data.frame(
+    Theme = theme,
+    Score = up_res["score"] - down_res["score"],
+    Up_n_terms = up_res["n_terms"],
+    Down_n_terms = down_res["n_terms"]
+  )
+})
+
+biology_shift_normalized <- bind_rows(norm_results)
+biology_shift_normalized <- biology_shift_normalized[biology_shift_normalized$Score != 0, ]
+
+print(biology_shift_normalized)  # inspect: check n_terms columns to see how much
+# term-count was inflating the raw-sum version
+
+p_shift_norm <- ggplot(biology_shift_normalized, aes(x = reorder(Theme, Score), y = Score, fill = Score)) +
+  geom_col(width = 0.8) +
+  coord_flip() +
+  scale_fill_gradient2(low = "#1d3557", mid = "white", high = "#b22222", midpoint = 0) +
+  geom_hline(yintercept = 0, linewidth = 1) +
+  theme_bw(base_size = 14) +
+  theme(legend.position = "none",
+        panel.grid.minor = element_blank(),
+        panel.grid.major.y = element_blank(),
+        plot.title = element_text(hjust = 0.5, face = "bold")) +
+  labs(title = "Biological Shift (rank/mean-normalized)\nMean signal strength per theme, not term count",
+       x = NULL,
+       y = expression("Mean " * -log[10](p)~"(up) " - "Mean " * -log[10](p)~"(down)"))
+
+ggsave("Biological_Shift_Plot_NORMALIZED.png", p_shift_norm, width = 10, height = 6, dpi = 600, bg = "white")
+
+# Side-by-side comparison table: raw-sum score vs normalized score
+comparison <- merge(
+  biology_shift[, c("Theme", "Score")],
+  biology_shift_normalized[, c("Theme", "Score", "Up_n_terms", "Down_n_terms")],
+  by = "Theme", all = TRUE, suffixes = c("_RawSum", "_MeanNorm")
+)
+print(comparison)
+write.csv(comparison, "Shift_Score_Comparison.csv", row.names = FALSE)
