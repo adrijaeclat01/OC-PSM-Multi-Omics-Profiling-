@@ -1,0 +1,306 @@
+############################################################
+# GSE133296 RNA-Seq Differential Expression Analysis
+# Primary Ovary vs Omental Metastasis
+# Linux + R Workflow
+############################################################
+
+############################
+# Linux Commands
+############################
+
+# Launch WSL
+wsl
+
+# Configure institute proxy (if required)
+export http_proxy=http://1**.***.**.***:****
+export https_proxy=http://1**.***.**.***:****
+
+# Activate Conda
+source ~/miniconda3/bin/activate
+
+# Activate environment (if created)
+conda activate rnaseq
+
+# Go to project directory
+cd ~/GSE133296_Transcriptomics
+
+# Verify project structure
+ls
+
+# Verify dataset
+ls data
+
+# Launch R
+R
+
+
+############################################################
+# R Commands
+############################################################
+
+library(readxl)
+library(DESeq2)
+library(EnhancedVolcano)
+library(ggplot2)
+
+setwd("~/GSE133296_Transcriptomics")
+
+counts <- read_excel(
+  "data/GSE133296_Raw.Normalized_Counts_submit.xlsx"
+)
+
+dim(counts)
+head(counts)
+colnames(counts)
+
+############################################################
+# Extract Raw Counts
+############################################################
+
+raw_counts <- counts[
+  ,
+  grep(
+    "Raw.Read.Count",
+    colnames(counts)
+  )
+]
+
+rownames(raw_counts) <- counts$Gene_ID
+
+raw_counts <- as.matrix(raw_counts)
+
+############################################################
+# Select Primary vs Omental Samples
+############################################################
+
+selected_counts <- raw_counts[
+  ,
+  grep(
+    "ov_Raw|om_met_Raw",
+    colnames(raw_counts)
+  )
+]
+
+############################################################
+# Clean Sample Names
+############################################################
+
+colnames(selected_counts) <- gsub(
+  "_Raw.Read.Count",
+  "",
+  colnames(selected_counts)
+)
+
+colnames(selected_counts) <- make.unique(
+  colnames(selected_counts)
+)
+
+############################################################
+# Create Metadata
+############################################################
+
+condition <- ifelse(
+  grepl(
+    "om_met",
+    colnames(selected_counts)
+  ),
+  "Omental_metastasis",
+  "Primary"
+)
+
+metadata <- data.frame(
+  condition = condition
+)
+
+rownames(metadata) <- colnames(selected_counts)
+
+all(
+  colnames(selected_counts) ==
+  rownames(metadata)
+)
+
+############################################################
+# Create DESeq2 Object
+############################################################
+
+dds <- DESeqDataSetFromMatrix(
+  countData = selected_counts,
+  colData = metadata,
+  design = ~ condition
+)
+
+############################################################
+# Filter Low Count Genes
+############################################################
+
+keep <- rowSums(
+  counts(dds)
+) >= 10
+
+dds <- dds[keep, ]
+
+############################################################
+# Differential Expression Analysis
+############################################################
+
+dds <- DESeq(dds)
+
+############################################################
+# Extract Results
+############################################################
+
+res <- results(
+  dds,
+  contrast = c(
+    "condition",
+    "Omental_metastasis",
+    "Primary"
+  )
+)
+
+############################################################
+# Add Gene Annotation
+############################################################
+
+res_df <- as.data.frame(res)
+
+res_df$Gene_ID <- rownames(res_df)
+
+annotation <- counts[
+  ,
+  c(
+    "Gene_ID",
+    "Gene_Name",
+    "Gene_Biotype"
+  )
+]
+
+final_DEG <- merge(
+  annotation,
+  res_df,
+  by = "Gene_ID"
+)
+
+final_DEG_clean <- final_DEG[
+  !is.na(final_DEG$padj),
+]
+
+############################################################
+# Significant DEGs
+############################################################
+
+met_up <- final_DEG_clean[
+  final_DEG_clean$padj < 0.05 &
+  final_DEG_clean$log2FoldChange > 1,
+]
+
+met_down <- final_DEG_clean[
+  final_DEG_clean$padj < 0.05 &
+  final_DEG_clean$log2FoldChange < -1,
+]
+
+nrow(met_up)
+nrow(met_down)
+
+############################################################
+# Save DEG Tables
+############################################################
+
+write.csv(
+  final_DEG_clean,
+  "results/All_DEGs.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  met_up,
+  "results/Metastasis_Upregulated.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  met_down,
+  "results/Metastasis_Downregulated.csv",
+  row.names = FALSE
+)
+
+############################################################
+# Volcano Plot
+############################################################
+
+EnhancedVolcano(
+  final_DEG_clean,
+  lab = final_DEG_clean$Gene_Name,
+  x = "log2FoldChange",
+  y = "padj",
+  pCutoff = 0.05,
+  FCcutoff = 1,
+  title = "Omental Metastasis vs Primary",
+  subtitle = "Differential Expression",
+  xlab = "Log2 Fold Change (Omental / Primary)",
+  pointSize = 2,
+  labSize = 3,
+  legendPosition = "right"
+)
+
+ggsave(
+  "figures/Volcano_Omental_vs_Primary.png",
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+############################################################
+# PCA Plot
+############################################################
+
+vsd <- vst(dds)
+
+pca_plot <- plotPCA(
+  vsd,
+  intgroup = "condition"
+)
+
+pca_plot
+
+ggsave(
+  "figures/PCA_Omental_vs_Primary.png",
+  plot = pca_plot,
+  width = 7,
+  height = 5,
+  dpi = 300
+)
+
+############################################################
+# Export Normalized Counts
+############################################################
+
+normalized_counts <- counts(
+  dds,
+  normalized = TRUE
+)
+
+write.csv(
+  normalized_counts,
+  "results/Normalized_Counts.csv"
+)
+
+############################################################
+# Save Workspace
+############################################################
+
+save.image(
+  "results/GSE133296_Workspace.RData"
+)
+
+############################################################
+# Reload Workspace (Future Sessions)
+############################################################
+
+load(
+  "results/GSE133296_Workspace.RData"
+)
+
+############################################################
+# End of Pipeline
+############################################################
